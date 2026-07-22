@@ -3,5 +3,8 @@ global:
 
 scrape_configs:
   - job_name: 'litellm'
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/litellm_bearer_token  # LiteLLM master key; /metrics requires auth by default
     static_configs:
       - targets: ['litellm:4000']  # Assuming Litellm exposes metrics at port 4000

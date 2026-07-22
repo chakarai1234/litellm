@@ -5,13 +5,10 @@ services:
       args:
         target: runtime
     image: docker.litellm.ai/berriai/litellm:main-stable
-    #########################################
-    ## Uncomment these lines to start proxy with a config.yaml file ##
-    # volumes:
-    #  - ./config.yaml:/app/config.yaml
-    # command:
-    #  - "--config=/app/config.yaml"
-    ##############################################
+    volumes:
+      - ./config.yaml:/app/config.yaml
+    command:
+      - "--config=/app/config.yaml"
     ports:
       - "4000:4000" # Map the container port to the host, change the host port if necessary
     environment:
@@ -22,8 +19,10 @@ services:
       # is auto-refreshed alongside the writer.
       # DATABASE_URL_READ_REPLICA: "postgresql://llmproxy:dbpassword9090@db-reader:5432/litellm"
       STORE_MODEL_IN_DB: "True" # allows adding models to proxy via UI
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY} # Same key Prometheus sends as Bearer token to /metrics
     env_file:
-      - .env # Load local .env file
+      - path: .env # Load local .env file
+        required: false
     depends_on:
       - db  # Indicates that this service depends on the 'db' service, ensuring 'db' starts first
     healthcheck:  # Defines the health check configuration for the container
@@ -60,10 +59,23 @@ services:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml
     ports:
       - "9090:9090"
+    depends_on:
+      litellm:
+        condition: service_healthy
+    environment:
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY} # Written to the bearer token file at startup; never stored on the host
+    entrypoint: ["/bin/sh", "-c"]
     command:
-      - "--config.file=/etc/prometheus/prometheus.yml"
-      - "--storage.tsdb.path=/prometheus"
-      - "--storage.tsdb.retention.time=15d"
+      - |
+        if [ -z "$$LITELLM_MASTER_KEY" ]; then
+          echo "LITELLM_MASTER_KEY is not set; /metrics scrapes would get 401" >&2
+          exit 1
+        fi
+        printf '%s' "$$LITELLM_MASTER_KEY" > /etc/prometheus/litellm_bearer_token
+        exec /bin/prometheus \
+          --config.file=/etc/prometheus/prometheus.yml \
+          --storage.tsdb.path=/prometheus \
+          --storage.tsdb.retention.time=15d
     restart: always
 
 volumes:
