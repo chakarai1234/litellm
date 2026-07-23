@@ -6,7 +6,11 @@ services:
         target: runtime
     image: docker.litellm.ai/berriai/litellm:main-stable
     volumes:
-      - ./config.yaml:/app/config.yaml
+      - type: bind
+        source: ./config.yaml
+        target: /app/config.yaml
+        bind:
+          create_host_path: false
     command:
       - "--config=/app/config.yaml"
     ports:
