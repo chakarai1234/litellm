@@ -163,6 +163,15 @@ class MCPServer(BaseModel):
     allow_elicitation: bool = False
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
+    def __repr__(self) -> str:
+        return (
+            f"MCPServer(server_id={self.server_id!r}, name={self.name!r}, "
+            f"transport={self.transport!r}, auth_type={self.auth_type!r})"
+        )
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
     @property
     def has_client_credentials(self) -> bool:
         """True if this server should use the OAuth2 client_credentials (M2M) flow.
@@ -261,12 +270,3 @@ class MCPServer(BaseModel):
         if self.oauth_passthrough is not True:
             return False
         return any(h.lower() == "authorization" for h in self.extra_headers)
-
-    @property
-    def has_token_exchange_config(self) -> bool:
-        """True if this server is configured for OAuth2 token exchange (OBO / RFC 8693)."""
-        return (
-            self.auth_type == MCPAuth.oauth2_token_exchange
-            and bool(self.client_id and self.client_secret)
-            and bool(self.token_exchange_endpoint or self.token_url)
-        )

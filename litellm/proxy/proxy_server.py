@@ -230,7 +230,9 @@ from litellm.constants import (
     DAYS_IN_A_MONTH,
     DEFAULT_HEALTH_CHECK_INTERVAL,
     DEFAULT_MODEL_CREATED_AT_TIME,
+    GLOBAL_PROXY_SPEND_CACHE_KEY,
     LITELLM_PROXY_ADMIN_NAME,
+    LITELLM_PROXY_BUDGET_NAME,
     PROMETHEUS_FALLBACK_STATS_SEND_TIME_HOURS,
     PROXY_BATCH_POLLING_ENABLED,
     PROXY_BATCH_POLLING_INTERVAL,
@@ -1054,10 +1056,9 @@ async def proxy_startup_event(app: FastAPI):
 
     verbose_proxy_logger.debug("prisma_client: %s", prisma_client)
     if prisma_client is not None and litellm.max_budget > 0:
-        ProxyStartupEvent._add_proxy_budget_to_db(litellm_proxy_budget_name=litellm_proxy_admin_name)
+        ProxyStartupEvent._add_proxy_budget_to_db()
         asyncio.create_task(
             ProxyStartupEvent._warm_global_spend_cache(
-                litellm_proxy_admin_name=litellm_proxy_admin_name,
                 user_api_key_cache=user_api_key_cache,
                 prisma_client=prisma_client,
             )
@@ -2002,7 +2003,7 @@ health_check_results: Dict[str, Union[int, List[Dict[str, Any]]]] = {}
 background_health_check_loop_active = False
 background_health_check_cycle_seq = 0
 queue: List = []
-litellm_proxy_budget_name = "litellm-proxy-budget"
+litellm_proxy_budget_name = LITELLM_PROXY_BUDGET_NAME
 litellm_proxy_admin_name = LITELLM_PROXY_ADMIN_NAME
 ui_access_mode: Union[Literal["admin", "all"], Dict] = "all"
 proxy_budget_rescheduler_min_time = PROXY_BUDGET_RESCHEDULER_MIN_TIME
@@ -2871,15 +2872,13 @@ async def update_cache(
                     )
                 )
             ## UPDATE GLOBAL PROXY ##
-            global_proxy_spend = await user_api_key_cache.async_get_cache(
-                key="{}:spend".format(litellm_proxy_admin_name)
-            )
+            global_proxy_spend = await user_api_key_cache.async_get_cache(key=GLOBAL_PROXY_SPEND_CACHE_KEY)
             if global_proxy_spend is None:
                 # do nothing if not in cache
                 return
             elif response_cost is not None and global_proxy_spend is not None:
                 increment = global_proxy_spend + response_cost
-                values_to_update_in_cache.append(("{}:spend".format(litellm_proxy_admin_name), increment))
+                values_to_update_in_cache.append((GLOBAL_PROXY_SPEND_CACHE_KEY, increment))
         except Exception as e:
             verbose_proxy_logger.warning(
                 "Spend tracking - failed to update user spend in cache. "
@@ -3040,7 +3039,7 @@ async def update_cache(
     if tags is not None:
         await _update_tag_cache()
 
-    global_proxy_spend_key = "{}:spend".format(litellm_proxy_admin_name)
+    global_proxy_spend_key = GLOBAL_PROXY_SPEND_CACHE_KEY
     local_object_updates = tuple((k, v) for k, v in values_to_update_in_cache if k != global_proxy_spend_key)
     shared_scalar_updates = tuple((k, v) for k, v in values_to_update_in_cache if k == global_proxy_spend_key)
 
@@ -7772,29 +7771,32 @@ class ProxyStartupEvent:
         )
 
     @classmethod
-    def _add_proxy_budget_to_db(cls, litellm_proxy_budget_name: str):
+    def _add_proxy_budget_to_db(cls):
         """Adds a global proxy budget to db"""
         if litellm.budget_duration is None:
             raise Exception("budget_duration not set on Proxy. budget_duration is required to use max_budget.")
 
-        asyncio.create_task(cls._upsert_proxy_budget_with_reset_at_backfill(litellm_proxy_budget_name))
+        asyncio.create_task(cls._upsert_proxy_budget_with_reset_at_backfill())
 
     @classmethod
-    async def _upsert_proxy_budget_with_reset_at_backfill(cls, litellm_proxy_budget_name: str) -> None:
+    async def _upsert_proxy_budget_with_reset_at_backfill(cls) -> None:
         """
-        Upsert the proxy admin user row with the configured max_budget /
-        budget_duration, then backfill budget_reset_at if currently NULL.
+        Upsert the proxy budget aggregate user row with the configured
+        max_budget / budget_duration, then backfill budget_reset_at if
+        currently NULL.
 
         The backfill uses `WHERE budget_reset_at IS NULL` so it only fires
         when the row pre-existed without a reset schedule (e.g. row created
         via a different path before the proxy budget was configured). On
         subsequent restarts it no-ops, so an active reset window is never
-        slid forward.
+        slid forward. It also zeroes spend at that moment: a row that was
+        never on a reset schedule holds lifetime accrual, which must not
+        gate the first duration window.
         """
         await generate_key_helper_fn(  # type: ignore
             request_type="user",
             table_name="user",
-            user_id=litellm_proxy_budget_name,
+            user_id=LITELLM_PROXY_BUDGET_NAME,
             duration=None,
             models=[],
             aliases={},
@@ -7817,10 +7819,13 @@ class ProxyStartupEvent:
             try:
                 await UserRepository(prisma_client).table.update_many(
                     where={
-                        "user_id": litellm_proxy_budget_name,
+                        "user_id": LITELLM_PROXY_BUDGET_NAME,
                         "budget_reset_at": None,
                     },
-                    data={"budget_reset_at": get_budget_reset_time(budget_duration=litellm.budget_duration)},
+                    data={
+                        "budget_reset_at": get_budget_reset_time(budget_duration=litellm.budget_duration),
+                        "spend": 0,
+                    },
                 )
             except Exception as e:
                 verbose_proxy_logger.warning("Failed to backfill budget_reset_at on proxy admin row: %s", e)
@@ -7828,13 +7833,12 @@ class ProxyStartupEvent:
     @classmethod
     async def _warm_global_spend_cache(
         cls,
-        litellm_proxy_admin_name: str,
         user_api_key_cache: UserApiKeyCache,
         prisma_client: PrismaClient,
     ) -> None:
         """Warm global spend cache once at startup to reduce impact of first wave of requests."""
         try:
-            cache_key = "{}:spend".format(litellm_proxy_admin_name)
+            cache_key = GLOBAL_PROXY_SPEND_CACHE_KEY
             await _fetch_global_spend_with_event_coordination(
                 cache_key=cache_key,
                 user_api_key_cache=user_api_key_cache,
@@ -13472,7 +13476,7 @@ async def fallback_login(request: Request):
 @router.post("/login", include_in_schema=False)  # hidden since this is a helper for UI sso login
 async def login(request: Request):
     global premium_user, general_settings, master_key
-    from litellm.proxy.auth.login_utils import authenticate_user, create_ui_token_object
+    from litellm.proxy.auth.login_utils import authenticate_user, create_ui_token_object, encode_ui_session_jwt
     from litellm.proxy.utils import get_custom_url
 
     form = await request.form()
@@ -13495,13 +13499,7 @@ async def login(request: Request):
     )
 
     # Generate JWT token
-    import jwt
-
-    jwt_token = jwt.encode(
-        cast(dict, returned_ui_token_object),
-        cast(str, master_key),
-        algorithm="HS256",
-    )
+    jwt_token = encode_ui_session_jwt(returned_ui_token_object, cast(str, master_key))
 
     # Build redirect URL
     litellm_dashboard_ui = get_custom_url(str(request.base_url))
@@ -13511,16 +13509,51 @@ async def login(request: Request):
         litellm_dashboard_ui += "/ui/"
     litellm_dashboard_ui += "?login=success"
 
+    # Honor a same-origin return_to preserved by the sign-in page (e.g. the aggregate DCR connect flow's
+    # authorize round-trip), mirroring the SSO callback; otherwise land on the dashboard. Gated by
+    # _is_same_origin_return_path (strictly relative path) so it can never be an open redirect, and the
+    # one-shot cookie is cleared after use.
+    from litellm.proxy.management_endpoints.ui_sso import _sso_return_to_redirect
+
+    # Resume through the SAME resumer the SSO callback uses, rather than a second, narrower arm.
+    # _persist_return_to_cookie stores both shapes it accepts (a relative same-origin path AND a
+    # control_plane_url-matching absolute URL); honoring only the relative one here silently dropped
+    # the control-plane case, landing the user on the dashboard. One function decides how a stored
+    # return_to is honored for EVERY sign-in branch, so the write and read sets cannot diverge: it
+    # sets the token cookie on the same-origin arm and hands off via a one-time login code on the
+    # cross-origin arm, and clears the one-shot cookie in both.
+    cp_return_to = request.cookies.get("litellm_cp_return_to")
+    if cp_return_to:
+        try:
+            resumed = await _sso_return_to_redirect(
+                return_to=cp_return_to,
+                jwt_token=jwt_token,
+                redis_usage_cache=redis_usage_cache,
+                user_api_key_cache=user_api_key_cache,
+            )
+        except Exception:  # noqa: BLE001  # resuming must NEVER block a completed sign-in
+            # The symmetric half of _persist_return_to_cookie's "never raises" contract. The resumer
+            # rejects a return_to that no longer matches control_plane_url (a config change between
+            # the cookie's write and this read), and the user has ALREADY authenticated here —
+            # failing their login over a stale one-shot cookie is the worst possible outcome. Land
+            # on the dashboard instead; the cookie is cleared below either way.
+            verbose_proxy_logger.info("Ignoring stale litellm_cp_return_to cookie; landing on dashboard")
+            resumed = None
+        if resumed is not None:
+            return resumed
+
     # Create redirect response with cookie
     redirect_response = RedirectResponse(url=litellm_dashboard_ui, status_code=303)
     redirect_response.set_cookie(key="token", value=jwt_token)
+    if cp_return_to:
+        redirect_response.delete_cookie(key="litellm_cp_return_to")
     return redirect_response
 
 
 @router.post("/v2/login", include_in_schema=False)  # hidden helper for UI logins via API
 async def login_v2(request: Request):
     global premium_user, general_settings, master_key
-    from litellm.proxy.auth.login_utils import authenticate_user, create_ui_token_object
+    from litellm.proxy.auth.login_utils import authenticate_user, create_ui_token_object, encode_ui_session_jwt
     from litellm.proxy.utils import get_custom_url
 
     try:
@@ -13541,13 +13574,7 @@ async def login_v2(request: Request):
             premium_user=premium_user,
         )
 
-        import jwt
-
-        jwt_token = jwt.encode(
-            cast(dict, returned_ui_token_object),
-            cast(str, master_key),
-            algorithm="HS256",
-        )
+        jwt_token = encode_ui_session_jwt(returned_ui_token_object, cast(str, master_key))
 
         litellm_dashboard_ui = get_custom_url(str(request.base_url))
         if litellm_dashboard_ui.endswith("/"):
@@ -13591,7 +13618,7 @@ async def login_v2(request: Request):
 )  # control-plane login — always returns token in body for cross-origin use
 async def login_v3(request: Request):
     global premium_user, general_settings, master_key
-    from litellm.proxy.auth.login_utils import authenticate_user, create_ui_token_object
+    from litellm.proxy.auth.login_utils import authenticate_user, create_ui_token_object, encode_ui_session_jwt
     from litellm.proxy.utils import get_custom_url
 
     try:
@@ -13620,13 +13647,7 @@ async def login_v3(request: Request):
             premium_user=premium_user,
         )
 
-        import jwt
-
-        jwt_token = jwt.encode(
-            cast(dict, returned_ui_token_object),
-            cast(str, master_key),
-            algorithm="HS256",
-        )
+        jwt_token = encode_ui_session_jwt(returned_ui_token_object, cast(str, master_key))
 
         litellm_dashboard_ui = get_custom_url(str(request.base_url))
         if litellm_dashboard_ui.endswith("/"):
